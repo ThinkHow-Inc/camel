@@ -25,6 +25,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.StringJoiner;
+import java.util.TreeSet;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -88,6 +89,12 @@ final class TextBodyFlow {
             "lastModified", "charset", "extendedAttributes", "body", "parent", "absoluteFilePath", "relativeFilePath",
             "absolute", "endpointPath", "directory", "copyFromAbsoluteFilePath", "lastOffsetValue", "fileSeparator",
             "binding");
+
+    /** The origin of the text a marshal writes from a body that is not known. */
+    private static final String UNKNOWN_MARSHAL = "writes the body as text (the body before it is not known here)";
+
+    /** What ${body.x} may read of a List without it being a field of an element: ${body.size}, ${body.empty}. */
+    private static final Set<String> LIST_PROPERTIES = Set.of("size", "empty", "class", "length");
 
     /** body.x, body?.x, message.body.x, followed by what comes after the name. */
     private static final Pattern GROOVY_PROPERTY = Pattern.compile("(?<![\\w$])body\\s*\\??\\.\\s*([A-Za-z_]\\w*)\\s*([{(])?");
@@ -188,19 +195,50 @@ final class TextBodyFlow {
         String format();
     }
 
-    /** Parsed data: the Map or the List an unmarshal makes of the text. */
-    record Parsed(String origin, String format) implements Body {
+    /**
+     * Parsed data: the Map or the List an unmarshal makes of the text; list when it is known to be a List; the fields
+     * of the JSON data it was parsed from, when the files of the project say them.
+     */
+    record Parsed(String origin, String format, boolean list, ProjectFacts.JsonFields fields) implements Body {
+
+        Parsed(String origin, String format) {
+            this(origin, format, false, null);
+        }
+
+        Parsed(String origin, String format, boolean list) {
+            this(origin, format, list, null);
+        }
     }
 
-    /** Text: the payload as it was read or written; marshalled when a marshal wrote it from parsed data. */
-    record Text(String origin, String format, boolean file, boolean marshalled) implements Body {
+    /** How a setBody emptied the body: to null (${null}), or to empty text (constant ""). */
+    enum Emptied {
+        TO_NULL,
+        TO_EMPTY_TEXT
+    }
+
+    /**
+     * Text: the payload as it was read or written; marshalled when a marshal wrote it from parsed data; the resource it
+     * was loaded from (file:orders.json) when a setBody with constant: resource: loaded it; emptied when a setBody set
+     * it to null or to empty text, which has no field to read.
+     */
+    record Text(String origin, String format, boolean file, boolean marshalled, String resource, Emptied emptied)
+            implements
+                Body {
 
         Text(String origin, String format) {
-            this(origin, format, false, false);
+            this(origin, format, false, false, null, null);
         }
 
         Text(String origin, String format, boolean file) {
-            this(origin, format, file, false);
+            this(origin, format, file, false, null, null);
+        }
+
+        Text(String origin, String format, boolean file, boolean marshalled) {
+            this(origin, format, file, marshalled, null, null);
+        }
+
+        Text(String origin, String format, boolean file, boolean marshalled, String resource) {
+            this(origin, format, file, marshalled, resource, null);
         }
 
         /** The names that can be read from this body without parsing it. */
@@ -224,7 +262,8 @@ final class TextBodyFlow {
     private record Walk(String routeId, Map<String, JsonNode> byFrom, List<Error> errors, Set<String> seen, boolean post,
             Map<String, Map<String, String>> operations, Map<String, Map<String, List<String>>> requestFields,
             Map<String, ProjectFacts.Observed> observed, CatalogBodyTypes bodyTypes,
-            Map<String, ProjectFacts.KameletDataTypes> kamelets, Map<String, Body> variables) {
+            Map<String, ProjectFacts.KameletDataTypes> kamelets, Map<String, Body> variables, Set<String> jsonArrays,
+            Map<String, ProjectFacts.JsonFields> jsonFields, Map<String, List<Body>> sent) {
 
         /**
          * The walk of a route a step calls: for its outcome alone, and the variables of the message it changes. The
@@ -232,15 +271,20 @@ final class TextBodyFlow {
          */
         Walk called() {
             return new Walk(
-                    null, byFrom, null, seen, false, operations, requestFields, observed, bodyTypes, kamelets, variables);
+                    null, byFrom, null, seen, false, operations, requestFields, observed, bodyTypes, kamelets, variables,
+                    jsonArrays, jsonFields, sent);
         }
 
         /** The walk of the steps of a block: what a branch puts in a variable stays in the branch. */
         Walk branch() {
             return new Walk(
                     routeId, byFrom, errors, seen, post, operations, requestFields, observed, bodyTypes, kamelets,
-                    new HashMap<>(variables));
+                    new HashMap<>(variables), jsonArrays, jsonFields, sent);
         }
+    }
+
+    /** A direct: or seda: route whose body at the start is not known, to walk again with what the file sends to it. */
+    private record Unknown(String uri, String routeId, JsonNode steps, NodePath at, boolean post) {
     }
 
     static void check(JsonNode target, NodePath path, List<Error> errors, ProjectFacts facts, CatalogBodyTypes bodyTypes) {
@@ -254,6 +298,11 @@ final class TextBodyFlow {
         Set<String> restReplies = unbound ? restReplies(target, facts) : Set.of();
         Map<String, ProjectFacts.Observed> observed = facts != null ? facts.observed() : Map.of();
         Map<String, ProjectFacts.KameletDataTypes> kamelets = facts != null ? facts.kamelets() : Map.of();
+        Set<String> jsonArrays = facts != null ? facts.jsonArrays() : Set.of();
+        Map<String, ProjectFacts.JsonFields> jsonFields = facts != null ? facts.jsonFields() : Map.of();
+        // the bodies the routes send to each direct: or seda: endpoint, and the routes whose start is not known
+        Map<String, List<Body>> sent = new HashMap<>();
+        List<Unknown> unknown = new ArrayList<>();
         Map<String, JsonNode> byFrom = new HashMap<>();
         for (JsonNode entry : target) {
             JsonNode from = from(entry);
@@ -301,9 +350,12 @@ final class TextBodyFlow {
                 // the message the consumer receives is in the variable
                 put(variables, received, consumerBody(uri, from, bodyTypes, "from: " + normalize(uri) + " gives it"));
             }
+            if (start == null && !variable && INTERNAL.contains(consumer)) {
+                unknown.add(new Unknown(normalize(uri), id, steps, at, post));
+            }
             Body end = walk(steps, start, at, new Walk(
                     id, byFrom, errors, new HashSet<>(), post, operations,
-                    requestFields, observed, bodyTypes, kamelets, variables));
+                    requestFields, observed, bodyTypes, kamelets, variables, jsonArrays, jsonFields, sent));
             // the body at the end of the route of a consumer that replies with text (platform-http), or of the route of
             // a REST call, is the reply
             boolean rest = uri != null && restReplies.contains(normalize(uri));
@@ -319,7 +371,36 @@ final class TextBodyFlow {
                         parsed));
             }
         }
+        // a direct: or seda: route that every call of the file sends the same JSON data to: what it reads of that data
+        // is checked against its fields (r24 route-filter-and-multicast step 2: ${body[lineCount]} in the route the
+        // multicast sends the order to). Only those reports: the route was walked already
+        for (Unknown route : unknown) {
+            List<Body> bodies = sent.get(route.uri());
+            if (bodies == null || bodies.isEmpty() || !(bodies.get(0) instanceof Parsed first) || first.fields() == null
+                    || first.list()
+                    || bodies.stream().anyMatch(b -> !(b instanceof Parsed p) || !first.fields().equals(p.fields()))) {
+                continue;
+            }
+            List<Error> found = new ArrayList<>();
+            walk(route.steps(), new Parsed(
+                    "every call of " + route.uri() + " in the file sends it", first.format(), false,
+                    first.fields()), route.at(),
+                    new Walk(
+                            route.routeId(), byFrom, found, new HashSet<>(), route.post(), operations, requestFields,
+                            observed, bodyTypes, kamelets, new HashMap<>(), jsonArrays, jsonFields, new HashMap<>()));
+            for (Error e : found) {
+                if (String.valueOf(e.getMessage()).contains(NO_FIELD)) {
+                    errors.add(e);
+                }
+            }
+        }
     }
+
+    /** The components a route of the file is reached through, with the body of its caller. */
+    private static final Set<String> INTERNAL = Set.of("direct", "seda", "direct-vm");
+
+    /** What a report of a field the JSON data does not have says. */
+    private static final String NO_FIELD = ", but the data here has no field ";
 
     /**
      * Whether the steps set or read an HTTP control header (CamelHttpMethod, CamelHttpQuery...), which can make an http
@@ -347,9 +428,9 @@ final class TextBodyFlow {
             return null;
         }
         if (out.payload()) {
-            // the file as read has the format of the files it reads
+            // the file as read has the format of the files it reads, and the data of the files in its directory
             return out.file()
-                    ? new Text(consumer, fileFormat(from), true)
+                    ? new Text(consumer, fileFormat(from), true, false, directoryKey(uri, from))
                     : new Text(consumer + " as " + out.inWords(), out.dataFormat());
         }
         return out.data() ? new Parsed(consumer + " as " + out.inWords(), out.dataFormat()) : null;
@@ -419,6 +500,10 @@ final class TextBodyFlow {
             String name = step.fieldNames().next();
             JsonNode value = step.get(name);
             NodePath here = at.append(j).append(name);
+            if (w.errors() != null) {
+                recordSend(name, value, body, w);
+            }
+            boolean splitWalked = false;
             if (w.errors() != null && parsesData(name, value, body, here, w)) {
                 // the unmarshal fails at runtime, so what comes after it is not run: one report
                 body = null;
@@ -434,8 +519,27 @@ final class TextBodyFlow {
                     }
                     if (read != null) {
                         w.errors().add(error(here, w.routeId(), read, text));
+                    } else if (text.emptied() == Emptied.TO_EMPTY_TEXT) {
+                        String post = postOfEmptyText(name, value, w);
+                        if (post != null) {
+                            w.errors().add(emptyPostError(here, w.routeId(), post, text));
+                        }
                     }
+                } else if (body instanceof Parsed parsed && parsed.list()
+                        && (listRead(value) != null || templateRead(name, value, LIST_PROPERTIES) != null)) {
+                    String read = listRead(value);
+                    w.errors().add(listError(here, w.routeId(),
+                            read != null ? read : templateRead(name, value, LIST_PROPERTIES), parsed));
+                    // the read fails at runtime, so what comes after it is not run with this body: one report
+                    body = null;
+                    continue;
                 } else if (body instanceof Parsed parsed) {
+                    String unknownField = parsed.list() || parsed.fields() == null
+                            ? null : unknownField(name, value, parsed.fields());
+                    if (unknownField != null) {
+                        // a field that is not there is null, and the route goes on
+                        w.errors().add(fieldError(here, w.routeId(), unknownField, parsed.fields()));
+                    }
                     Need need = needsText(name, value, w);
                     Parsed element = "split".equals(name) ? splitElement(value, parsed, w.bodyTypes()) : null;
                     if (need != null) {
@@ -448,8 +552,14 @@ final class TextBodyFlow {
                         }
                     } else if (element != null) {
                         walk(value.get("steps"), element, here.append("steps"), w.branch());
+                        splitWalked = true;
                     }
                 }
+            }
+            if ("split".equals(name) && !splitWalked && w.errors() != null && value != null && value.isObject()) {
+                // an element that is not known: what the steps of the split set themselves still is, such as the
+                // empty text a GET is then sent with (r24 connect-http-client)
+                walk(value.get("steps"), null, here.append("steps"), w.branch());
             }
             if (w.errors() != null) {
                 readsOfVariables(name, value, here, w);
@@ -493,6 +603,16 @@ final class TextBodyFlow {
                 if (read != null) {
                     w.errors().add(error(at.append(key), w.routeId(), read, text));
                 }
+            } else if (body instanceof Parsed parsed && parsed.list()) {
+                String read = listEntry(key, child);
+                if (read != null) {
+                    w.errors().add(listError(at.append(key), w.routeId(), read, parsed));
+                }
+            } else if (body instanceof Parsed parsed && parsed.fields() != null) {
+                String read = unknownField(key, child, parsed.fields());
+                if (read != null) {
+                    w.errors().add(fieldError(at.append(key), w.routeId(), read, parsed.fields()));
+                }
             }
         }
     }
@@ -515,7 +635,17 @@ final class TextBodyFlow {
                         : null;
             }
             case "unmarshal" -> {
-                return unmarshalled(value, w.bodyTypes());
+                Parsed parsed = unmarshalled(value, w.bodyTypes());
+                ProjectFacts.JsonFields fields = parsed != null && "json".equals(parsed.format())
+                        && body instanceof Text text && text.resource() != null
+                                ? w.jsonFields().get(text.resource()) : null;
+                if (parsed != null && "json".equals(parsed.format()) && body instanceof Text text
+                        && text.resource() != null && w.jsonArrays().contains(text.resource())) {
+                    String file = text.resource().substring(text.resource().indexOf(':') + 1);
+                    return new Parsed(
+                            "unmarshal: json turns the JSON array of " + file + " into a List", "json", true, fields);
+                }
+                return fields != null ? new Parsed(parsed.origin(), "json", fields.list(), fields) : parsed;
             }
             case "marshal" -> {
                 return marshalled(value, body);
@@ -535,6 +665,15 @@ final class TextBodyFlow {
                     return body;
                 }
                 return producerBody(out, "transformDataType: " + toTypeOf(value) + " makes it");
+            }
+            case "pollEnrich", "poll" -> {
+                // with no variableReceive and no aggregation strategy the polled message is the body: a file as it was
+                // read (r24 enrich step 2: ${body[name]} after a pollEnrich of the customer file, which the validator
+                // took for unknown)
+                String uri = sendUri(name, value);
+                return uri != null && !mergesTheReply(value)
+                        ? consumerBody(uri, endpointNode(uri), w.bodyTypes(), name + ": " + normalize(uri) + " gives it")
+                        : null;
             }
             case "kamelet" -> {
                 // what the Kamelet leaves, as the transformer of its out data type says
@@ -644,11 +783,23 @@ final class TextBodyFlow {
         if (expression == null) {
             return null;
         }
+        // r24 connect-http-client: a setBody ${null} before the split of the lines, and a constant "" before a GET
+        if (("constant".equals(language) && expression.isEmpty())
+                || ("simple".equals(language) && expression.trim().isEmpty())) {
+            return new Text(
+                    "setBody with " + language + " \"\" sets empty text", null, false, false, null,
+                    Emptied.TO_EMPTY_TEXT);
+        }
+        if ("simple".equals(language) && "${null}".equals(expression.trim())) {
+            return new Text("setBody with ${null} empties it", null, false, false, null, Emptied.TO_NULL);
+        }
         if ("constant".equals(language)) {
             String origin = expression.startsWith("resource:")
                     ? "setBody with constant: " + expression + " loads the file as text"
                     : "setBody with constant sets text";
-            return new Text(origin, formatOf(expression));
+            return new Text(
+                    origin, formatOf(expression), false, false,
+                    expression.startsWith("resource:") ? expression.substring("resource:".length()).trim() : null);
         }
         if ("simple".equals(language)) {
             String trimmed = expression.trim();
@@ -672,9 +823,16 @@ final class TextBodyFlow {
         return out != null && out.data() ? new Parsed("unmarshal: " + format + " turns the text into data", format) : null;
     }
 
-    /** The text a marshal writes; marshalled when the body it writes is known to be parsed data. */
+    /**
+     * The text a marshal writes; marshalled when the body it writes is known to be parsed data. When the body before it
+     * is not known, as at the start of a direct: route a wire tap sends to, the origin says so: the marshal may then be
+     * the step the model wants, and the field is read too late, or a marshal written for an unmarshal.
+     */
     private static Text marshalled(JsonNode value, Body body) {
         String format = dataFormatOf(value);
+        if (body == null) {
+            return new Text("marshal" + (format != null ? ": " + format : "") + " " + UNKNOWN_MARSHAL, format);
+        }
         return new Text(
                 "marshal" + (format != null ? ": " + format : "")
                         + " writes data as text (marshal turns data into text, unmarshal turns text into data)",
@@ -787,6 +945,19 @@ final class TextBodyFlow {
             case "marshal" -> marshalled(value, body);
             default -> null;
         };
+    }
+
+    /** Whether a pollEnrich merges the polled message with the message, so the body after it is not known. */
+    private static boolean mergesTheReply(JsonNode value) {
+        if (value == null || !value.isObject()) {
+            return false;
+        }
+        for (var it = value.fieldNames(); it.hasNext();) {
+            if (it.next().startsWith("aggregationStrategy")) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** What a setVariable sets: the body for simple ${body}, text for a constant or a simple template. */
@@ -1036,7 +1207,7 @@ final class TextBodyFlow {
             if (readIn(step.get(name), TEXT_PROPERTIES) != null || readsAFieldWithJsonPath(step.get(name))) {
                 return new Parsed(
                         parsed.origin() + ", and split " + expression.trim() + " gives its elements as data",
-                        parsed.format());
+                        parsed.format(), false, "simple".equals(language) ? elementFields(parsed, expression) : null);
             }
             if (!bodyTypes.keepsTheBody(name, step.get(name))) {
                 return null;
@@ -1358,6 +1529,66 @@ final class TextBodyFlow {
         return expression != null && expression.isValueNode() ? expression.asText() : null;
     }
 
+    /**
+     * A simple expression in this node, not in nested steps, that reads a field of a List as if it were one element
+     * (${body.orderId}, ${body[orderId]}); what it reads, or null. Groovy is left alone: body.orderId of a List is the
+     * List of the orderIds of its elements there.
+     */
+    private static String listRead(JsonNode node) {
+        if (node == null) {
+            return null;
+        }
+        if (node.isArray()) {
+            for (JsonNode child : node) {
+                String found = listRead(child);
+                if (found != null) {
+                    return found;
+                }
+            }
+            return null;
+        }
+        if (!node.isObject()) {
+            return null;
+        }
+        for (var it = node.fieldNames(); it.hasNext();) {
+            String key = it.next();
+            if ("steps".equals(key)) {
+                continue;
+            }
+            String found = listEntry(key, node.get(key));
+            if (found != null) {
+                return found;
+            }
+        }
+        return null;
+    }
+
+    /** One entry of a node: a simple expression that reads a field of a List, or anything nested that does. */
+    private static String listEntry(String key, JsonNode child) {
+        if ("simple".equals(key)) {
+            String found = simpleRead(expressionText(child), LIST_PROPERTIES);
+            return found != null ? "simple reads a field of the body (" + found + ")" : null;
+        }
+        return "groovy".equals(key) ? null : listRead(child);
+    }
+
+    private static Error listError(NodePath at, String routeId, String read, Parsed parsed) {
+        Matcher m = FIELD_READ.matcher(read);
+        String field = m.find() ? m.group(1) : "id";
+        return Error.builder()
+                .keyword("type")
+                .instanceLocation(at)
+                .messageKey("type")
+                .format(new MessageFormat("{0}"))
+                .arguments((routeId != null ? "route " + routeId + ": " : "") + read
+                           + ", but the body here is a List, not one element, and a List has no field " + field
+                           + " - " + parsed.origin() + ": to pick the element whose " + field
+                           + " has a given value, use jsonpath: \"$[?(@." + field + " == '${header." + field + "}')]\" with"
+                           + " resultType java.util.Map (the element, or null when none or several match); ${body[0]."
+                           + field + "} reads the first element; or split it")
+                .build();
+    }
+
     /** A Groovy or simple expression in this node, not in nested steps, that reads fields; what it reads, or null. */
     private static String readIn(JsonNode node, Set<String> readable) {
         if (node == null) {
@@ -1484,6 +1715,19 @@ final class TextBodyFlow {
     }
 
     private static Error error(NodePath at, String routeId, String read, Text text) {
+        if (text.emptied() != null) {
+            return Error.builder()
+                    .keyword("type")
+                    .instanceLocation(at)
+                    .messageKey("type")
+                    .format(new MessageFormat("{0}"))
+                    .arguments((routeId != null ? "route " + routeId + ": " : "") + read + ", but the body here is "
+                               + (text.emptied() == Emptied.TO_NULL ? "null" : "empty text") + " - " + text.origin()
+                               + ": empty the body later, right before the step that needs no body (such as an http"
+                               + " GET, and inside the split when the call is made for each element), so the fields"
+                               + " are read before that")
+                    .build();
+        }
         String format = text.format();
         String fix;
         if (text.marshalled()) {
@@ -1491,6 +1735,13 @@ final class TextBodyFlow {
             fix = "read the field before the marshal, for example into a variable with setVariable, or keep the data in"
                   + " the body and marshal into a variable (marshal with variableReceive, and send that variable with"
                   + " variableSend)";
+        } else if (text.origin().endsWith(UNKNOWN_MARSHAL)) {
+            // r23 enrich s3: told "unmarshal is the step", a model added an unmarshal of the Map the wire tap sent
+            fix = "read the field before the marshal, for example into a variable with setVariable"
+                  + (format != null
+                          ? "; only when the body before the marshal was text that you meant to parse, unmarshal: "
+                            + format + " is the step, not marshal"
+                          : "");
         } else if (format == null) {
             fix = "unmarshal it first with the data format of the payload (json, jacksonXml, csv, ...) to read its fields";
         } else if (text.origin().startsWith("marshal")) {
@@ -1508,6 +1759,144 @@ final class TextBodyFlow {
                                    ? ", but the body here is the file as it was read (a GenericFile), not parsed data - "
                                    : ", but the body here is still text, not parsed data - ")
                            + text.origin() + ": " + fix)
+                .build();
+    }
+
+    /** The key of the JSON data in the directory a file consumer reads, or null for any other consumer. */
+    private static String directoryKey(String uri, JsonNode from) {
+        if (!"file".equals(scheme(uri))) {
+            return null;
+        }
+        String path = uri.indexOf(':') > 0 ? normalize(uri).substring(uri.indexOf(':') + 1) : null;
+        if ((path == null || path.isBlank()) && from != null && from.isObject() && from.get("parameters") != null
+                && from.get("parameters").get("directoryName") != null) {
+            path = from.get("parameters").get("directoryName").asText();
+        }
+        return path != null && !path.isBlank() ? ProjectFacts.directoryKey(path) : null;
+    }
+
+    /** Remembers the body a step sends to a direct: or seda: endpoint, for the route of the file that consumes it. */
+    private static void recordSend(String name, JsonNode value, Body body, Walk w) {
+        if (!SENDS_THE_BODY.contains(name)) {
+            return;
+        }
+        String uri = sendUri(name, value);
+        if (uri != null && INTERNAL.contains(scheme(uri)) && !uri.contains("${")) {
+            w.sent().computeIfAbsent(normalize(uri), k -> new ArrayList<>()).add(body);
+        }
+    }
+
+    /** ${body.lines}, ${body[lines]} or ${body['lines']}: one field of the body, and nothing else. */
+    private static final Pattern ONE_FIELD
+            = Pattern.compile("\\$\\{body(?:\\??\\.([A-Za-z_]\\w*)|\\[\\s*['\"]?([A-Za-z_]\\w*)['\"]?\\s*])}");
+
+    /** The names a field read may be that are not fields of the data: what a Map or a List has itself. */
+    private static final Set<String> COLLECTION_PROPERTIES = Set.of("size", "empty", "class", "length", "isEmpty",
+            "keySet", "values", "entrySet");
+
+    /**
+     * The first read of a field of the body that the JSON data does not have, in the simple expressions and templates
+     * of a step (not of its nested steps), as written; null when the data has every field read.
+     */
+    private static String unknownField(String name, JsonNode value, ProjectFacts.JsonFields fields) {
+        List<String> texts = new ArrayList<>();
+        if ("simple".equals(name)) {
+            texts.add(expressionText(value));
+        } else {
+            simpleExpressions(value, texts);
+            templates(name, value).forEach(t -> texts.add(t.text()));
+        }
+        for (String text : texts) {
+            Matcher m = text != null ? FIELD_READ.matcher(text) : null;
+            while (m != null && m.find()) {
+                String field = m.group(1);
+                boolean call = m.end() < text.length() && text.charAt(m.end()) == '(';
+                if (!call && !COLLECTION_PROPERTIES.contains(field) && !fields.fields().contains(field)) {
+                    int end = text.indexOf('}', m.start());
+                    return end > 0 ? text.substring(m.start(), end + 1) : m.group();
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * The fields of the elements a simple split of a field of the data gives: ${body[lines]} of an order gives its
+     * lines; ${body} of a list its elements. Null when not known.
+     */
+    private static ProjectFacts.JsonFields elementFields(Parsed parsed, String expression) {
+        ProjectFacts.JsonFields fields = parsed.fields();
+        String e = expression.trim();
+        if (fields == null || !THE_BODY.matcher(e).matches()) {
+            return null;
+        }
+        if ("${body}".equals(e)) {
+            return fields.list()
+                    ? new ProjectFacts.JsonFields(
+                            "one element of " + fields.where(), fields.fields(), fields.elementFields(), false, null)
+                    : null;
+        }
+        Matcher m = ONE_FIELD.matcher(e);
+        String field = !fields.list() && m.matches() ? m.group(1) != null ? m.group(1) : m.group(2) : null;
+        Set<String> element = field != null ? fields.elementFields().get(field) : null;
+        return element != null
+                ? new ProjectFacts.JsonFields(
+                        "one of the " + field + " of " + fields.where(), element, Map.of(), false, fields.fields())
+                : null;
+    }
+
+    private static Error fieldError(NodePath at, String routeId, String read, ProjectFacts.JsonFields fields) {
+        Matcher m = FIELD_READ.matcher(read);
+        String field = m.find() ? m.group(1) : read;
+        String advice;
+        if (fields.outer().contains(field)) {
+            advice = field + " is a field of the data that was split, not of its element: read it before the split,"
+                     + " into a variable (setVariable), and write ${variable." + field + "} in the split";
+        } else {
+            String list = fields.elementFields().keySet().stream().sorted().findFirst().orElse(null);
+            advice = "read one of those"
+                     + (list != null ? " (the number of " + list + " is ${body[" + list + "].size()})" : "");
+        }
+        return Error.builder()
+                .keyword("type")
+                .instanceLocation(at)
+                .messageKey("type")
+                .format(new MessageFormat("{0}"))
+                .arguments((routeId != null ? "route " + routeId + ": " : "") + "simple reads " + read + NO_FIELD
+                           + field + " (the fields of " + fields.where() + ": "
+                           + String.join(", ", new TreeSet<>(fields.fields())) + "): " + advice)
+                .build();
+    }
+
+    /**
+     * An http call that sends empty text as a POST: the http producer sends a POST for any body that is not null, and
+     * empty text is a body (HttpMethodHelper). r24 connect-http-client: a setBody with constant "" before a GET of the
+     * stock service gave 87 times 405 Method Not Allowed. Null when the step is no such call.
+     */
+    private static String postOfEmptyText(String name, JsonNode value, Walk w) {
+        if (!w.post() || !SENDS_THE_BODY.contains(name) || w.bodyTypes().needsNoBody(name, value)) {
+            return null;
+        }
+        String uri = sendUri(name, value);
+        String scheme = scheme(uri);
+        if (!"http".equals(scheme) && !"https".equals(scheme)) {
+            return null;
+        }
+        return sendsTheBody(uri, "enrich".equals(name) ? endpointNode(uri) : value)
+                ? name + ": " + scheme + " sends the body as the request, and empty text is still a body, so the call"
+                  + " is a POST"
+                : null;
+    }
+
+    private static Error emptyPostError(NodePath at, String routeId, String post, Text text) {
+        return Error.builder()
+                .keyword("type")
+                .instanceLocation(at)
+                .messageKey("type")
+                .format(new MessageFormat("{0}"))
+                .arguments((routeId != null ? "route " + routeId + ": " : "") + post + " - " + text.origin()
+                           + ": set the body to null for a call with no body (setBody with simple: ${null}), or set"
+                           + " httpMethod: GET")
                 .build();
     }
 

@@ -22,11 +22,13 @@ import org.apache.camel.Processor;
 import org.apache.camel.Producer;
 import org.apache.camel.spi.UriEndpoint;
 import org.apache.camel.spi.UriParam;
+import org.apache.camel.spi.UriPath;
 import org.apache.camel.support.DefaultEndpoint;
 
 @UriEndpoint(firstVersion = "4.24.0", scheme = "web-index", title = "Web Index",
              syntax = "web-index://service/path", category = { Category.SEARCH })
 public class WebIndexEndpoint extends DefaultEndpoint {
+    @UriPath(description = "Path appended to the web index service URL")
     private final String path;
     @UriParam
     private String serviceUrl;
@@ -38,14 +40,36 @@ public class WebIndexEndpoint extends DefaultEndpoint {
         this.path = path;
     }
 
-    public String getPath() { return path; }
-    public String getServiceUrl() { return serviceUrl; }
-    public void setServiceUrl(String serviceUrl) { this.serviceUrl = serviceUrl; }
-    public int getTimeout() { return timeout; }
-    public void setTimeout(int timeout) { this.timeout = timeout; }
+    public String getPath() {
+        return path;
+    }
+
+    public String getServiceUrl() {
+        return serviceUrl;
+    }
+
+    /**
+     * Base URL of the HTTP web index service receiving requests.
+     */
+    public void setServiceUrl(String serviceUrl) {
+        this.serviceUrl = serviceUrl;
+    }
+
+    public int getTimeout() {
+        return timeout;
+    }
+
+    /**
+     * Connection and request timeout in milliseconds.
+     */
+    public void setTimeout(int timeout) {
+        this.timeout = timeout;
+    }
 
     @Override
-    public Producer createProducer() throws Exception { return new WebIndexProducer(this); }
+    public Producer createProducer() throws Exception {
+        return new WebIndexProducer(this);
+    }
 
     @Override
     public Consumer createConsumer(Processor processor) throws Exception {

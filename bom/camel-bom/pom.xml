@@ -138,6 +138,11 @@
       </dependency>
       <dependency>
         <groupId>org.apache.camel</groupId>
+        <artifactId>camel-apicurio-registry</artifactId>
+        <version>4.24.0-SNAPSHOT</version>
+      </dependency>
+      <dependency>
+        <groupId>org.apache.camel</groupId>
         <artifactId>camel-arangodb</artifactId>
         <version>4.24.0-SNAPSHOT</version>
       </dependency>
@@ -534,6 +539,11 @@
       <dependency>
         <groupId>org.apache.camel</groupId>
         <artifactId>camel-cbor</artifactId>
+        <version>4.24.0-SNAPSHOT</version>
+      </dependency>
+      <dependency>
+        <groupId>org.apache.camel</groupId>
+        <artifactId>camel-chaos</artifactId>
         <version>4.24.0-SNAPSHOT</version>
       </dependency>
       <dependency>
@@ -1374,6 +1384,11 @@
       </dependency>
       <dependency>
         <groupId>org.apache.camel</groupId>
+        <artifactId>camel-jbang-run</artifactId>
+        <version>4.24.0-SNAPSHOT</version>
+      </dependency>
+      <dependency>
+        <groupId>org.apache.camel</groupId>
         <artifactId>camel-jcache</artifactId>
         <version>4.24.0-SNAPSHOT</version>
       </dependency>
@@ -1790,6 +1805,11 @@
       <dependency>
         <groupId>org.apache.camel</groupId>
         <artifactId>camel-mongodb-gridfs</artifactId>
+        <version>4.24.0-SNAPSHOT</version>
+      </dependency>
+      <dependency>
+        <groupId>org.apache.camel</groupId>
+        <artifactId>camel-mtconnect</artifactId>
         <version>4.24.0-SNAPSHOT</version>
       </dependency>
       <dependency>

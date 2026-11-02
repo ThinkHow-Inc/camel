@@ -22,11 +22,13 @@ import org.apache.camel.Processor;
 import org.apache.camel.Producer;
 import org.apache.camel.spi.UriEndpoint;
 import org.apache.camel.spi.UriParam;
+import org.apache.camel.spi.UriPath;
 import org.apache.camel.support.DefaultEndpoint;
 
 @UriEndpoint(firstVersion = "4.24.0", scheme = "headless-browser", title = "Headless Browser",
              syntax = "headless-browser://service/path", category = { Category.SEARCH })
 public class HeadlessBrowserEndpoint extends DefaultEndpoint {
+    @UriPath(description = "Path appended to the browser service URL")
     private final String path;
     @UriParam
     private String serviceUrl;
@@ -38,14 +40,36 @@ public class HeadlessBrowserEndpoint extends DefaultEndpoint {
         this.path = path;
     }
 
-    public String getPath() { return path; }
-    public String getServiceUrl() { return serviceUrl; }
-    public void setServiceUrl(String serviceUrl) { this.serviceUrl = serviceUrl; }
-    public int getTimeout() { return timeout; }
-    public void setTimeout(int timeout) { this.timeout = timeout; }
+    public String getPath() {
+        return path;
+    }
+
+    public String getServiceUrl() {
+        return serviceUrl;
+    }
+
+    /**
+     * Base URL of the HTTP browser service receiving requests.
+     */
+    public void setServiceUrl(String serviceUrl) {
+        this.serviceUrl = serviceUrl;
+    }
+
+    public int getTimeout() {
+        return timeout;
+    }
+
+    /**
+     * Connection and request timeout in milliseconds.
+     */
+    public void setTimeout(int timeout) {
+        this.timeout = timeout;
+    }
 
     @Override
-    public Producer createProducer() throws Exception { return new HeadlessBrowserProducer(this); }
+    public Producer createProducer() throws Exception {
+        return new HeadlessBrowserProducer(this);
+    }
 
     @Override
     public Consumer createConsumer(Processor processor) throws Exception {

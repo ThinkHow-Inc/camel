@@ -23,6 +23,7 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+
 import org.apache.camel.Exchange;
 import org.apache.camel.support.DefaultProducer;
 
@@ -42,7 +43,7 @@ public class WebIndexProducer extends DefaultProducer {
         String body = exchange.getIn().getBody(String.class);
         String path = endpoint.getPath();
         String requestUrl = endpoint.getServiceUrl().replaceAll("/$", "") + "/"
-                + URLEncoder.encode(path, StandardCharsets.UTF_8).replace("%2F", "/");
+                            + URLEncoder.encode(path, StandardCharsets.UTF_8).replace("%2F", "/");
         HttpRequest request = HttpRequest.newBuilder(URI.create(requestUrl))
                 .timeout(Duration.ofMillis(endpoint.getTimeout()))
                 .header("Content-Type", "application/json")
